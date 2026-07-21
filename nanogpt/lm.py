@@ -68,6 +68,29 @@ class MultiHeadAttention(nn.Module):
         out = self.o_proj(output)
         return out
 
+class MLP(nn.Module):
+    def __init__(self, n_embed):
+        super().__init__()
+        self.fc1 = nn.Linear(n_embed, n_embed**4)
+        self.gelu = nn.GELU()
+        self.fc2 = nn.Linear(n_embed**4, n_embed)
+    def forward(self, x):
+        x_1 = self.fc2(self.gelu(self.fc1(x)))
+        return x_1
+
+class LayerNorm(nn.Module):
+    def __init__(self, n_embed, eps = 1e-5):
+        super().__init__()
+        self.eps = eps
+        self.gamma = nn.Parameter(torch.ones(n_embed))
+        self.beta = nn.Parameter(torch.zeros(n_embed))
+    def forward(self, x):
+        mean = torch.mean(x, dim=-1, keepdim=True)
+        var = torch.var(x, dim=-1, keepdim=True)
+        normalized = (x - mean) / (var + self.eps)**0.5
+        scaled = normalized * self.gamma + self.beta
+        return scaled
+
 class BigramLanguageModel(nn.Module):
     def __init__(self):
         super().__init__()
