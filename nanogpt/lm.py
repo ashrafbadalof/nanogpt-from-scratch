@@ -4,6 +4,8 @@ import torch.nn.functional as F
 
 block_size = 8
 batch_size = 16
+n_embed = 32
+n_heads = 4
 
 with open("data/tinyshakespeare.txt", encoding='utf-8') as f:
     data = f.read()
@@ -36,12 +38,50 @@ def get_batch(data):
     x, y = x.to(device), y.to(device)
     return x, y
 
+class MultiHeadAttention(nn.Module):
+    def __init__(self, n_embed, n_heads):
+        super().__init__()
+        self.q_proj = nn.Linear(n_embed, n_embed)
+        self.k_proj = nn.Linear(n_embed, n_embed)
+        self.v_proj = nn.Linear(n_embed, n_embed)
+        self.o_proj = nn.Linear(n_embed, n_embed)
+        self.n_embed = n_embed
+        self.n_heads = n_heads
+        self.head_dim = n_embed // n_heads
+
+    def forward(self, x):
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        B, T, _ = x.shape
+        q = q.reshape((B, T, self.n_heads, self.head_dim)).transpose(1, 2)
+        k = k.reshape((B, T, self.n_heads, self.head_dim)).transpose(1, 2)
+        v = v.reshape((B, T, self.n_heads, self.head_dim)).transpose(1, 2)
+
+        attention_scores = (q @ k.transpose(-2, -1)) / self.head_dim ** 0.5
+        mask = torch.tril(torch.ones(T, T, device=x.device))
+        attention_scores = attention_scores.masked_fill(mask==0, float('-inf'))
+        attention_weights = F.softmax(attention_scores, dim=-1)
+        output = attention_weights @ v
+        output = output.transpose(1, 2).contiguous().view(B, T, self.n_embed)
+        out = self.o_proj(output)
+        return out
+
 class BigramLanguageModel(nn.Module):
     def __init__(self):
         super().__init__()
-        self.embedding_table = nn.Embedding(vocab_size, vocab_size)
+        self.positional_embedding = nn.Embedding(block_size, n_embed)
+        self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
+        self.mha = MultiHeadAttention(n_embed, n_heads)
+        self.lm_head = nn.Linear(n_embed, vocab_size)
     def forward(self,idx, targets = None):
-        logits = self.embedding_table(idx)
+        B, T = idx.shape
+        tok_emb = self.token_embedding_table(idx)
+        pos_emb = self.positional_embedding(torch.arange(T, device=device))
+        x = tok_emb + pos_emb
+        mha = self.mha(x)
+        logits = self.lm_head(mha)
         if targets is None:
             loss = None
         else:
@@ -49,7 +89,8 @@ class BigramLanguageModel(nn.Module):
         return logits, loss
     def generate(self, idx, max_new_tokens):
         for _ in range(max_new_tokens):
-            logits, _ = self(idx)
+            idx_cond = idx[:, -block_size:]
+            logits, _ = self(idx_cond)
             logits = logits[:, -1, :]
             probs = F.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
