@@ -71,9 +71,9 @@ class MultiHeadAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, n_embed):
         super().__init__()
-        self.fc1 = nn.Linear(n_embed, n_embed**4)
+        self.fc1 = nn.Linear(n_embed, n_embed*4)
         self.gelu = nn.GELU()
-        self.fc2 = nn.Linear(n_embed**4, n_embed)
+        self.fc2 = nn.Linear(n_embed*4, n_embed)
     def forward(self, x):
         x_1 = self.fc2(self.gelu(self.fc1(x)))
         return x_1
@@ -86,25 +86,40 @@ class LayerNorm(nn.Module):
         self.beta = nn.Parameter(torch.zeros(n_embed))
     def forward(self, x):
         mean = torch.mean(x, dim=-1, keepdim=True)
-        var = torch.var(x, dim=-1, keepdim=True)
+        var = torch.var(x, dim=-1, keepdim=True, correction=0)
         normalized = (x - mean) / (var + self.eps)**0.5
         scaled = normalized * self.gamma + self.beta
         return scaled
+
+class TransformerBlock(nn.Module):
+    def __init__(self, n_embed, n_heads):
+        super().__init__()
+        self.ln1 = LayerNorm(n_embed)
+        self.mha = MultiHeadAttention(n_embed, n_heads)
+        self.ln2 = LayerNorm(n_embed)
+        self.mlp = MLP(n_embed)
+    def forward(self, x):
+        x = x + self.mha(self.ln1(x))
+        x = x + self.mlp(self.ln2(x))
+        return x
+
 
 class BigramLanguageModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.positional_embedding = nn.Embedding(block_size, n_embed)
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
-        self.mha = MultiHeadAttention(n_embed, n_heads)
+        self.ln = LayerNorm(n_embed)
+        self.block = TransformerBlock(n_embed, n_heads)
         self.lm_head = nn.Linear(n_embed, vocab_size)
     def forward(self,idx, targets = None):
         B, T = idx.shape
         tok_emb = self.token_embedding_table(idx)
         pos_emb = self.positional_embedding(torch.arange(T, device=device))
         x = tok_emb + pos_emb
-        mha = self.mha(x)
-        logits = self.lm_head(mha)
+        block = self.block(x)
+        ln_final = self.ln(block)
+        logits = self.lm_head(ln_final)
         if targets is None:
             loss = None
         else:
