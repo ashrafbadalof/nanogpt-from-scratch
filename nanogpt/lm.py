@@ -2,10 +2,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-block_size = 8
-batch_size = 16
-n_embed = 32
-n_heads = 4
+block_size = 256
+batch_size = 64
+n_embed = 384
+n_heads = 6
+n_layers = 6
+max_steps = 5000
+lr = 3e-4
+dropout = 0.2
+eval_iters = 200 # how many batches to average over
+eval_interval = 500
 
 with open("data/tinyshakespeare.txt", encoding='utf-8') as f:
     data = f.read()
@@ -39,7 +45,7 @@ def get_batch(data):
     return x, y
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, n_embed, n_heads):
+    def __init__(self, n_embed, n_heads, dropout):
         super().__init__()
         self.q_proj = nn.Linear(n_embed, n_embed)
         self.k_proj = nn.Linear(n_embed, n_embed)
@@ -48,6 +54,7 @@ class MultiHeadAttention(nn.Module):
         self.n_embed = n_embed
         self.n_heads = n_heads
         self.head_dim = n_embed // n_heads
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         q = self.q_proj(x)
@@ -63,20 +70,23 @@ class MultiHeadAttention(nn.Module):
         mask = torch.tril(torch.ones(T, T, device=x.device))
         attention_scores = attention_scores.masked_fill(mask==0, float('-inf'))
         attention_weights = F.softmax(attention_scores, dim=-1)
+        attention_weights = self.dropout(attention_weights)
         output = attention_weights @ v
         output = output.transpose(1, 2).contiguous().view(B, T, self.n_embed)
         out = self.o_proj(output)
         return out
 
 class MLP(nn.Module):
-    def __init__(self, n_embed):
+    def __init__(self, n_embed, dropout):
         super().__init__()
         self.fc1 = nn.Linear(n_embed, n_embed*4)
         self.gelu = nn.GELU()
         self.fc2 = nn.Linear(n_embed*4, n_embed)
+        self.dropout = nn.Dropout(dropout)
     def forward(self, x):
-        x_1 = self.fc2(self.gelu(self.fc1(x)))
-        return x_1
+        x = self.fc2(self.gelu(self.fc1(x)))
+        x = self.dropout(x)
+        return x
 
 class LayerNorm(nn.Module):
     def __init__(self, n_embed, eps = 1e-5):
@@ -92,32 +102,48 @@ class LayerNorm(nn.Module):
         return scaled
 
 class TransformerBlock(nn.Module):
-    def __init__(self, n_embed, n_heads):
+    def __init__(self, n_embed, n_heads, dropout):
         super().__init__()
         self.ln1 = LayerNorm(n_embed)
-        self.mha = MultiHeadAttention(n_embed, n_heads)
+        self.mha = MultiHeadAttention(n_embed, n_heads, dropout)
         self.ln2 = LayerNorm(n_embed)
-        self.mlp = MLP(n_embed)
+        self.mlp = MLP(n_embed, dropout)
     def forward(self, x):
         x = x + self.mha(self.ln1(x))
         x = x + self.mlp(self.ln2(x))
         return x
 
+@torch.no_grad()
+def estimate_loss():
+    out = {}
+    model.eval()
+    for split_name, split_data in [('train', train), ('val', val)]:
+        losses = torch.zeros(eval_iters)
+        for k in range(eval_iters):
+            xb, yb = get_batch(split_data)
+            logits, loss = model(xb, yb)
+            losses[k] = loss.item()
+        out[split_name] = losses.mean()
+    model.train()
+    return out
 
-class BigramLanguageModel(nn.Module):
+
+class GPTLanguageModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.positional_embedding = nn.Embedding(block_size, n_embed)
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
         self.ln = LayerNorm(n_embed)
-        self.block = TransformerBlock(n_embed, n_heads)
+        self.blocks = nn.Sequential(*[TransformerBlock(n_embed, n_heads, dropout) for _ in range(n_layers)])
         self.lm_head = nn.Linear(n_embed, vocab_size)
+        self.dropout = nn.Dropout(dropout)
     def forward(self,idx, targets = None):
         B, T = idx.shape
         tok_emb = self.token_embedding_table(idx)
         pos_emb = self.positional_embedding(torch.arange(T, device=device))
         x = tok_emb + pos_emb
-        block = self.block(x)
+        x = self.dropout(x)
+        block = self.blocks(x)
         ln_final = self.ln(block)
         logits = self.lm_head(ln_final)
         if targets is None:
@@ -134,21 +160,21 @@ class BigramLanguageModel(nn.Module):
             next_token = torch.multinomial(probs, num_samples=1)
             idx = torch.cat([idx, next_token], dim=1)
         return idx
-model = BigramLanguageModel()
+model = GPTLanguageModel()
 model.to(device)
-optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
-
-max_steps = 1000
+optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
 for step in range(max_steps):
+    if step % eval_interval == 0:
+        losses = estimate_loss()
+        print(f"step {step}: train {losses['train']:.4f}, val {losses['val']:.4f}")
+
     xb, yb = get_batch(train)
     logits, loss = model(xb, yb)
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
-    
-    if step % 100 == 0:
-        print(loss)
-print(f'final loss: {loss}')
+
+torch.save(model.state_dict(), "shakespeare_gpt.pt")
 
 context = torch.zeros((1,1), dtype=torch.long, device=device)
 print(decode(model.generate(context, max_new_tokens=300)[0].tolist()))
